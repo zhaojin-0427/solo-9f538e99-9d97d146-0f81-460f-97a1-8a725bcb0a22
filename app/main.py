@@ -1,8 +1,9 @@
-"""主平场制备 FastAPI 接口。
+"""主平场制备与重复性检验 FastAPI 接口。
 
-* ``GET  /docs``    Swagger 交互文档，可直接上传 FITS。
-* ``GET  /health``  存活探针。
-* ``POST /prepare`` 上传 3~12 张平场 FITS 与饱和阈值，返回成品 FITS。
+* ``GET  /docs``          Swagger 交互文档，可直接上传 FITS。
+* ``GET  /health``        存活探针。
+* ``POST /prepare``       上传 3~12 张平场 FITS 与饱和阈值，返回成品 FITS。
+* ``POST /repeatability`` 提交 3~12 份成品文件名，返回共同有效像元掩膜 FITS。
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from .pipeline import (
     MAX_FRAMES,
@@ -23,16 +25,36 @@ from .pipeline import (
     PreparationError,
     build_master_flat,
 )
+from .repeatability import (
+    MAX_PRODUCTS,
+    MIN_PRODUCTS,
+    build_repeatability_mask,
+)
 
 logger = logging.getLogger("master_flat")
 
+
+class RepeatabilityRequest(BaseModel):
+    """重复性检验请求：同一读出模式下本服务生成的全幅成品文件名。"""
+
+    filenames: list[str] = Field(
+        ...,
+        min_length=MIN_PRODUCTS,
+        max_length=MAX_PRODUCTS,
+        description=(
+            f"本服务 /prepare 生成的成品文件名（仅文件名，不含目录），"
+            f"数量 {MIN_PRODUCTS}~{MAX_PRODUCTS}；候选相机、滤镜与尺寸须一致"
+        ),
+    )
+
 app = FastAPI(
-    title="天文测光主平场制备接口",
-    version="1.0.0",
+    title="天文测光主平场制备与重复性检验接口",
+    version="1.1.0",
     description=(
         "上传 3~12 张已扣偏置的无压缩二维 16 位整数平场 FITS，"
         "按 BLANK / BSCALE / BZERO 处理后进行每帧中位数归一与像素级中位数聚合，"
-        "输出含校正系数主图与参与帧数扩展图的成品 FITS。"
+        "输出含校正系数主图与参与帧数扩展图的成品 FITS；"
+        "并可对多份成品做平场重复性检验，输出共同有效像元掩膜。"
     ),
 )
 
@@ -48,6 +70,7 @@ def _data_dir(env_name: str, default: str) -> Path:
 
 WORK_DIR = _data_dir("FLAT_WORK_DIR", "work")
 OUTPUT_DIR = _data_dir("FLAT_OUTPUT_DIR", "products")
+MASK_DIR = _data_dir("FLAT_MASK_DIR", "masks")
 UPLOAD_CHUNK = 4 * 2 ** 20
 
 
@@ -124,3 +147,38 @@ async def prepare_master_flat(
         )
     finally:
         shutil.rmtree(batch_dir, ignore_errors=True)
+
+
+@app.post("/repeatability", response_class=FileResponse)
+async def repeatability_mask(payload: RepeatabilityRequest) -> FileResponse:
+    """从 3~12 份成品中选出三份独立主平场，下载共同有效像元掩膜。
+
+    三份成品的源 ``EXPID`` 集合须两两无交集，共同有效像元（三份在同一
+    位置的 ``COUNTS`` 均 >= 3）取最多的一组；并列取文件名排序后字典序
+    最小的一组。掩膜共同有效像元填 1、其余填 0，头部列出入选文件名与
+    共同有效像元数。
+    """
+    # 与制备共用串行锁：256 MiB 预算下避免两个大请求叠加内存。
+    with _preparation_lock:
+        result = build_repeatability_mask(
+            filenames=list(payload.filenames),
+            output_dir=OUTPUT_DIR,
+            mask_dir=MASK_DIR,
+            work_dir=WORK_DIR,
+        )
+
+    logger.info(
+        "重复性掩膜生成成功：%s <- %s（共同有效像元 %d）",
+        result.path.name,
+        ", ".join(result.selected),
+        result.common_valid_pixels,
+    )
+    return FileResponse(
+        result.path,
+        media_type="application/fits",
+        filename=result.path.name,
+        headers={
+            "X-Common-Valid-Pixels": str(result.common_valid_pixels),
+            "X-Selected-Files": "; ".join(result.selected),
+        },
+    )

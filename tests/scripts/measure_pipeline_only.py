@@ -6,9 +6,16 @@
 from __future__ import annotations
 
 import resource
+import site
 import sys
 import time
 from pathlib import Path
+
+# 容器内依赖位于系统 site-packages，``-I`` 可直接导入；
+# 本地若依赖装在 user-site，``-I`` 会忽略它，这里显式补回以便压测。
+for _candidate in site.getusersitepackages(), *site.getsitepackages():
+    if _candidate and _candidate not in sys.path:
+        sys.path.append(_candidate)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 

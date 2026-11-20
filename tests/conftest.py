@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
+from app.pipeline import build_master_flat
+
 
 def make_flat_fits(
     path: Path,
@@ -97,5 +99,74 @@ def batch_factory(tmp_path):
                 )
             )
         return paths, raws, saturation
+
+    return _factory
+
+
+def _make_flat_frame(
+    path: Path,
+    raw: np.ndarray,
+    instrume: str,
+    filter_name: str,
+    expid: str | None,
+) -> Path:
+    """写一张带 INSTRUME/FILTER/EXPID 头卡的 16 位平场帧。"""
+    hdu = fits.PrimaryHDU(data=raw.astype(np.int16))
+    hdu.header["INSTRUME"] = instrume
+    hdu.header["FILTER"] = filter_name
+    if expid is not None:
+        hdu.header["EXPID"] = expid
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fits.HDUList([hdu]).writeto(path, overwrite=True)
+    return path
+
+
+@pytest.fixture
+def product_factory(tmp_path):
+    """通过真实 /prepare 管线造一份带 INSTRUME/FILTER/EXPIDnn 头的成品。
+
+    ``dead_rows`` 为该成品 COUNTS<3 的顶部行数，用于制造共同有效区域差异；
+    返回 ``(成品路径, 共同有效像元参考掩码)``。
+    """
+
+    def _factory(
+        name: str,
+        expids: list[str | None],
+        *,
+        height: int = 40,
+        width: int = 32,
+        instrume: str = "CAM-A",
+        filter_name: str = "g",
+        dead_rows: int = 0,
+        seed: int = 0,
+        products_dir: Path | None = None,
+    ) -> Path:
+        rng = np.random.default_rng(seed)
+        frame_dir = tmp_path / f"frames_{name}"
+        frame_paths = []
+        saturation = 5000.0
+        for i, expid in enumerate(expids):
+            raw = rng.integers(500, 900, size=(height, width)).astype(np.int32)
+            raw[:dead_rows, :] = 0  # 顶部若干行在所有帧无效 -> COUNTS=0
+            frame_paths.append(
+                _make_flat_frame(
+                    frame_dir / f"frame_{i:02d}.fits",
+                    raw,
+                    instrume,
+                    filter_name,
+                    expid,
+                )
+            )
+        out_dir = products_dir or (tmp_path / "products")
+        product = build_master_flat(
+            frame_paths,
+            [p.name for p in frame_paths],
+            saturation,
+            output_dir=out_dir,
+            work_dir=tmp_path / "work",
+        )
+        final = product.parent / name
+        product.rename(final)
+        return final
 
     return _factory

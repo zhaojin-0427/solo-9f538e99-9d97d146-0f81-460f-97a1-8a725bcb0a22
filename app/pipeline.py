@@ -62,6 +62,9 @@ class FrameInfo:
     bzero: float
     blank: int | None
     median: float
+    instrume: str | None = None
+    filter_name: str | None = None
+    expid: str | None = None
 
 
 def _open_raw(path: Path) -> fits.HDUList:
@@ -132,6 +135,17 @@ def _camera_filter_keys(header: fits.Header) -> dict[str, str]:
             if value:
                 result[key] = value
     return result
+
+
+def _string_card(header: fits.Header, key: str) -> str | None:
+    """读取字符串型头卡：缺失、空值或全空白均视为未提供。"""
+    if key not in header:
+        return None
+    raw = header[key]
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value or None
 
 
 def _read_scaling(header: fits.Header, name: str) -> tuple[float, float, int | None]:
@@ -306,6 +320,11 @@ def build_master_flat(
             shape = (int(hdu.data.shape[0]), int(hdu.data.shape[1]))
             bscale, bzero, blank = _read_scaling(hdu.header, path.name)
             camera_filter = _camera_filter_keys(hdu.header)
+            # 原帧提供的相机/滤镜/曝光号原样另存到成品头部；
+            # EXPID 缺失不影响本帧参与制备（仅重复性组合不可用）。
+            instrume = _string_card(hdu.header, "INSTRUME")
+            filter_name = _string_card(hdu.header, "FILTER")
+            expid = _string_card(hdu.header, "EXPID")
 
         if common_shape is None:
             common_shape = shape
@@ -330,7 +349,19 @@ def build_master_flat(
         if not math.isfinite(median) or median <= 0.0:
             raise PreparationError(f"帧 {path.name} 的有效中位数非法（{median}）")
         frames.append(
-            FrameInfo(path, source_name, shape, image_index, bscale, bzero, blank, median)
+            FrameInfo(
+                path,
+                source_name,
+                shape,
+                image_index,
+                bscale,
+                bzero,
+                blank,
+                median,
+                instrume=instrume,
+                filter_name=filter_name,
+                expid=expid,
+            )
         )
 
     assert common_shape is not None
@@ -410,6 +441,20 @@ def _write_output(
     header["NFRAMES"] = (len(frames), "Number of input flat frames")
     header["SATURATE"] = (saturation, "Saturation threshold in data units")
     header["MINCNT"] = (MIN_FRAMES_PER_PIXEL, "Minimum frames for a valid pixel")
+    # 原帧提供的 INSTRUME / FILTER 同批一致（缺失则不写），
+    # 各帧 EXPID 按序另存；缺 EXPID 的帧不写对应卡，仍可正常制备。
+    first_instrume = next((f.instrume for f in frames if f.instrume), None)
+    first_filter = next((f.filter_name for f in frames if f.filter_name), None)
+    if first_instrume is not None:
+        header["INSTRUME"] = (first_instrume, "Camera from source frames")
+    if first_filter is not None:
+        header["FILTER"] = (first_filter, "Filter from source frames")
+    for idx, frame in enumerate(frames):
+        if frame.expid is not None:
+            header[f"EXPID{idx + 1:02d}"] = (
+                frame.expid,
+                f"Exposure identifier of source frame {idx + 1}",
+            )
     header["CREATED"] = (
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "Creation time (UTC)",

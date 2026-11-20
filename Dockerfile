@@ -5,7 +5,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     FLAT_WORK_DIR=/data/work \
-    FLAT_OUTPUT_DIR=/data/products
+    FLAT_OUTPUT_DIR=/data/products \
+    FLAT_MASK_DIR=/data/masks
 
 WORKDIR /srv
 
@@ -14,7 +15,7 @@ RUN pip install --no-cache-dir -r /srv/requirements.txt
 
 COPY app /srv/app
 
-RUN mkdir -p /data/work /data/products && \
+RUN mkdir -p /data/work /data/products /data/masks && \
     useradd --create-home --uid 10001 appuser && \
     chown -R appuser:appuser /data /srv
 USER appuser
